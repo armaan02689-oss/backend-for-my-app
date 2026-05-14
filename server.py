@@ -2,29 +2,34 @@ from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
-import razorpay
-import hmac
 import hashlib
+import httpx
 from openai import OpenAI
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# Razorpay test keys (replace with live when ready)
-RAZORPAY_KEY_ID = os.environ.get("RAZORPAY_KEY_ID", "rzp_test_Sp7hZ2Ji3dXA8k")
-RAZORPAY_KEY_SECRET = os.environ.get("RAZORPAY_KEY_SECRET", "JmrynNMIIvAGbuZlDasvdbF6")
-razorpay_client = razorpay.Client(auth=(RAZORPAY_KEY_ID, RAZORPAY_KEY_SECRET))
+# --- UroPay Configuration ---
+UROPAY_API_KEY = os.environ.get("UROPAY_API_KEY", "YOUR_API_KEY_HERE")
+UROPAY_SECRET = os.environ.get("UROPAY_SECRET", "YOUR_SECRET_HERE")
+UROPAY_BASE_URL = "https://api.uropay.me"
 
-# Groq AI
+def get_uropay_headers():
+    """Create the headers required for UroPay API requests."""
+    hashed_secret = hashlib.sha512(UROPAY_SECRET.encode("utf-8")).hexdigest()
+    return {
+        "X-API-KEY": UROPAY_KEY,
+        "Authorization": f"Bearer {hashed_secret}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+# --- Groq AI (unchanged) ---
 groq_client = OpenAI(
     api_key=os.environ.get("GROQ_API_KEY", ""),
     base_url="https://api.groq.com/openai/v1"
 )
 
-# In‑memory premium store (replace with DB for production)
-premium_users = set()   # session_ids with active premium
-
-# ---------- AI ----------
 class AskRequest(BaseModel):
     question: str
     subject: str = "general"
@@ -46,68 +51,63 @@ async def ask_question(req: AskRequest):
     except Exception as e:
         return {"answer": f"Buddy is thinking... try again! Error: {str(e)[:100]}"}
 
-# ---------- UPI (instant activation, no admin) ----------
-@api_router.get("/upi/config")
-async def upi_config():
-    return {
-        "upi_id": "9319300296@ybl",
-        "name": "Buddy Premium",
-        "amount": 99,
-        "amount_paise": 9900,
-        "upi_link": "upi://pay?pa=9319300296@ybl&pn=Buddy%20Premium&am=99.00&cu=INR"
-    }
+# --- UroPay: Generate QR Code ---
+class GenerateOrderRequest(BaseModel):
+    amount_paise: int = 9900
+    customer_name: str = "Buddy User"
+    customer_email: str = "user@example.com"
 
-@api_router.post("/upi/claim")
-async def upi_claim(data: dict):
-    session_id = data.get("session_id")
-    utr = data.get("utr", "")
-    # Instantly activate premium – no verification
-    if session_id:
-        premium_users.add(session_id)
-    return {"ok": True, "is_premium": True, "status": "active"}
+@api_router.post("/upi/generate-qr")
+async def generate_upi_qr(req: GenerateOrderRequest):
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{UROPAY_BASE_URL}/order/generate",
+            headers=get_uropay_headers(),
+            json={
+                "amount": req.amount_paise,
+                "merchantOrderId": f"buddy_{os.urandom(4).hex()}",
+                "customerName": req.customer_name,
+                "customerEmail": req.customer_email,
+                "transactionNote": "Buddy Premium"
+            }
+        )
+        data = response.json()
+        return {
+            "qr_code": data["data"]["qrCode"],
+            "upi_link": data["data"]["upiString"],
+            "order_id": data["data"]["uroPayOrderId"]
+        }
 
-# ---------- Premium status ----------
-@api_router.get("/premium/status")
-async def premium_status(session_id: str):
-    return {
-        "is_premium": session_id in premium_users,
-        "scans_used": 0,
-        "scans_limit": 5,
-        "price_paise": 9900
-    }
-
-# ---------- Razorpay (instant activation) ----------
-class CreateOrderRequest(BaseModel):
+# --- UroPay: Verify Payment & Activate Premium ---
+class VerifyUpiRequest(BaseModel):
+    order_id: str
+    utr: str
     session_id: str
 
-@api_router.post("/subscription/create")
-async def create_order(req: CreateOrderRequest):
-    order = razorpay_client.order.create({
-        "amount": 9900,
-        "currency": "INR",
-        "payment_capture": 1
-    })
-    return {
-        "order_id": order["id"],
-        "key_id": RAZORPAY_KEY_ID,
-        "amount_paise": 9900,
-        "currency": "INR"
-    }
-
-class VerifyPaymentRequest(BaseModel):
-    session_id: str
-    razorpay_order_id: str
-    razorpay_payment_id: str
-    razorpay_signature: str
-
-@api_router.post("/subscription/verify")
-async def verify_payment(req: VerifyPaymentRequest):
-    body = f"{req.razorpay_order_id}|{req.razorpay_payment_id}".encode()
-    expected = hmac.new(RAZORPAY_KEY_SECRET.encode(), body, hashlib.sha256).hexdigest()
-    if not hmac.compare_digest(req.razorpay_signature, expected):
-        return {"error": "Invalid signature"}, 400
-    premium_users.add(req.session_id)
-    return {"is_premium": True, "message": "Premium activated!"}
+@api_router.post("/upi/verify")
+async def verify_upi_payment(req: VerifyUpiRequest):
+    async with httpx.AsyncClient() as client:
+        # Submit the UTR to UroPay
+        await client.patch(
+            f"{UROPAY_BASE_URL}/order/update",
+            headers=get_uropay_headers(),
+            json={
+                "uroPayOrderId": req.order_id,
+                "referenceNumber": req.utr
+            }
+        )
+        # Check the order status
+        status_response = await client.get(
+            f"{UROPAY_BASE_URL}/order/status/{req.order_id}",
+            headers={"X-API-KEY": UROPAY_API_KEY, "Accept": "application/json"}
+        )
+        status_data = status_response.json()
+        is_completed = status_data.get("data", {}).get("orderStatus") == "COMPLETED"
+        
+        return {
+            "is_premium": is_completed,
+            "message": "Premium activated!" if is_completed else "Payment verification in progress..."
+        }
 
 app.include_router(api_router)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
