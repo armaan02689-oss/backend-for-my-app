@@ -12,8 +12,6 @@ from pathlib import Path
 from pydantic import BaseModel, Field
 from typing import List, Optional
 from datetime import datetime, timezone, timedelta
-
-from emergentintegrations.llm.chat import LlmChat, UserMessage, ImageContent
 import razorpay
 
 
