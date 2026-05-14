@@ -2,15 +2,17 @@ from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
-import google.generativeai as genai
+from openai import OpenAI
 
 # Setup
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# Gemini AI setup
-genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-model = genai.GenerativeModel("gemini-2.0-flash")
+# Groq AI setup
+client = OpenAI(
+    api_key=os.environ.get("GROQ_API_KEY", ""),
+    base_url="https://api.groq.com/openai/v1"
+)
 
 class AskRequest(BaseModel):
     question: str
@@ -26,9 +28,13 @@ async def root():
 @api_router.post("/ask")
 async def ask_question(req: AskRequest):
     try:
-        prompt = f"You are Buddy, a friendly homework helper for kids. Subject: {req.subject}. Question: {req.question}. Give a clear, simple, step-by-step answer. Be encouraging!"
-        response = model.generate_content(prompt)
-        return {"answer": response.text}
+        prompt = f"You are Buddy, a friendly homework helper for kids. Subject: {req.subject}. Question: {req.question}. Give a clear, simple, step-by-step answer. Be encouraging and fun!"
+        response = client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500
+        )
+        return {"answer": response.choices[0].message.content}
     except Exception as e:
         return {"answer": f"Buddy is thinking... try again! Error: {str(e)[:100]}"}
 
