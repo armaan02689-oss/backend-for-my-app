@@ -118,7 +118,7 @@ async def check_uropay_status(order_id: str):
         status = data.get("data", {}).get("orderStatus", "PENDING")
         return {"status": status, "is_completed": status == "COMPLETED"}
 
-# ---------- Premium status (for usePremium hook) ----------
+# ---------- Premium status ----------
 @api_router.get("/premium/status")
 async def premium_status(session_id: str = ""):
     return {
@@ -128,23 +128,35 @@ async def premium_status(session_id: str = ""):
         "price_paise": 9900
     }
 
-# ---------- Scan (just re‑uses the AI) ----------
+# ---------- Scan (VISION AI – reads the photo!) ----------
 @api_router.post("/scan")
 async def scan_homework(req: ScanRequest):
-    prompt = (
-        f"You are Buddy, a homework helper. Subject: {req.subject}. "
-        f"Question: {req.question_text or 'Look at the uploaded homework image and describe the problem.'} "
-        "Give a clear, step‑by‑step answer."
-    )
+    if not req.image_base64:
+        return {"answer": "Please upload a photo of your homework."}
+
+    # Build the vision prompt
+    prompt = f"Look at the homework problem in the image. Subject: {req.subject}. "
+    if req.question_text:
+        prompt += f"Additional note: {req.question_text}. "
+    prompt += "Read the problem, solve it, and give a clear step-by-step answer. Be encouraging!"
+
     try:
+        # Use Groq's vision model
         response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500
+            model="llama-3.2-90b-vision-preview",
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": prompt},
+                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{req.image_base64}"}}
+                ]
+            }],
+            max_tokens=600
         )
         return {"answer": response.choices[0].message.content}
     except Exception as e:
-        return {"answer": f"Buddy is thinking... try again! Error: {str(e)[:100]}"}
+        # Fallback if vision model unavailable
+        return {"answer": f"Buddy couldn't read the photo. Please type the question or try a clearer image. (Error: {str(e)[:100]})"}
 
 # ---------- Include router & enable CORS ----------
 app.include_router(api_router)
