@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, Request
+from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -10,8 +10,8 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 # --- UroPay Configuration ---
-UROPAY_API_KEY = os.environ.get("UROPAY_API_KEY", "")
-UROPAY_SECRET = os.environ.get("UROPAY_SECRET", "")
+UROPAY_API_KEY = os.environ.get("UROPAY_API_KEY", "TEST_C1WGEUM2TMYLZDZY")
+UROPAY_SECRET = os.environ.get("UROPAY_SECRET", "TEST_HSIXY9M4S32S51D2W8185P5WT8636NBUMT23I9R12L643BVM3W")
 UROPAY_BASE_URL = "https://api.uropay.me"
 
 def get_uropay_headers():
@@ -73,6 +73,8 @@ async def generate_uropay_qr(req: GenerateUroPayOrder):
             }
         )
         data = response.json()
+        if "data" not in data:
+            return {"error": "Failed to generate QR", "details": data}
         return {
             "qr_code": data["data"]["qrCode"],
             "upi_link": data["data"]["upiString"],
