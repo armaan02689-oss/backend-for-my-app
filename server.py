@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
@@ -33,12 +33,26 @@ class AskRequest(BaseModel):
     question: str
     subject: str = "general"
 
-# --- Root health check ---
+class GenerateUroPayOrder(BaseModel):
+    amount_paise: int = 9900
+    customer_name: str = "Buddy User"
+    customer_email: str = "user@example.com"
+
+class UpdateUroPayOrder(BaseModel):
+    order_id: str
+    utr: str
+
+class ScanRequest(BaseModel):
+    subject: str = "general"
+    image_base64: str = ""
+    question_text: str = ""
+
+# ---------- Root ----------
 @api_router.get("/")
 async def root():
     return {"message": "Hello World"}
 
-# --- AI endpoint ---
+# ---------- AI Ask ----------
 @api_router.post("/ask")
 async def ask_question(req: AskRequest):
     try:
@@ -52,12 +66,7 @@ async def ask_question(req: AskRequest):
     except Exception as e:
         return {"answer": f"Buddy is thinking... try again! Error: {str(e)[:100]}"}
 
-# --- UroPay: Generate QR ---
-class GenerateUroPayOrder(BaseModel):
-    amount_paise: int = 9900
-    customer_name: str = "Buddy User"
-    customer_email: str = "user@example.com"
-
+# ---------- UroPay: Generate QR ----------
 @api_router.post("/uropay/generate-qr")
 async def generate_uropay_qr(req: GenerateUroPayOrder):
     async with httpx.AsyncClient() as client:
@@ -83,11 +92,7 @@ async def generate_uropay_qr(req: GenerateUroPayOrder):
             "order_id": data["data"]["uroPayOrderId"]
         }
 
-# --- UroPay: Update order with UTR ---
-class UpdateUroPayOrder(BaseModel):
-    order_id: str
-    utr: str
-
+# ---------- UroPay: Update order with UTR ----------
 @api_router.post("/uropay/update-order")
 async def update_uropay_order(req: UpdateUroPayOrder):
     async with httpx.AsyncClient() as client:
@@ -101,7 +106,7 @@ async def update_uropay_order(req: UpdateUroPayOrder):
         )
         return response.json()
 
-# --- UroPay: Check order status ---
+# ---------- UroPay: Check order status ----------
 @api_router.get("/uropay/status/{order_id}")
 async def check_uropay_status(order_id: str):
     async with httpx.AsyncClient() as client:
@@ -113,8 +118,34 @@ async def check_uropay_status(order_id: str):
         status = data.get("data", {}).get("orderStatus", "PENDING")
         return {"status": status, "is_completed": status == "COMPLETED"}
 
-# --- IMPORTANT: Include the router ---
-app.include_router(api_router)
+# ---------- Premium status (for usePremium hook) ----------
+@api_router.get("/premium/status")
+async def premium_status(session_id: str = ""):
+    return {
+        "is_premium": False,
+        "scans_used": 0,
+        "scans_limit": 5,
+        "price_paise": 9900
+    }
 
-# --- CORS (allow all origins) ---
+# ---------- Scan (just re‑uses the AI) ----------
+@api_router.post("/scan")
+async def scan_homework(req: ScanRequest):
+    prompt = (
+        f"You are Buddy, a homework helper. Subject: {req.subject}. "
+        f"Question: {req.question_text or 'Look at the uploaded homework image and describe the problem.'} "
+        "Give a clear, step‑by‑step answer."
+    )
+    try:
+        response = groq_client.chat.completions.create(
+            model="llama-3.3-70b-versatile",
+            messages=[{"role": "user", "content": prompt}],
+            max_tokens=500
+        )
+        return {"answer": response.choices[0].message.content}
+    except Exception as e:
+        return {"answer": f"Buddy is thinking... try again! Error: {str(e)[:100]}"}
+
+# ---------- Include router & enable CORS ----------
+app.include_router(api_router)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
