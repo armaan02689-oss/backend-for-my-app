@@ -33,10 +33,12 @@ class AskRequest(BaseModel):
     question: str
     subject: str = "general"
 
+# --- Root health check ---
 @api_router.get("/")
 async def root():
     return {"message": "Hello World"}
 
+# --- AI endpoint ---
 @api_router.post("/ask")
 async def ask_question(req: AskRequest):
     try:
@@ -50,7 +52,7 @@ async def ask_question(req: AskRequest):
     except Exception as e:
         return {"answer": f"Buddy is thinking... try again! Error: {str(e)[:100]}"}
 
-# --- UroPay: Generate QR Code ---
+# --- UroPay: Generate QR ---
 class GenerateUroPayOrder(BaseModel):
     amount_paise: int = 9900
     customer_name: str = "Buddy User"
@@ -111,5 +113,8 @@ async def check_uropay_status(order_id: str):
         status = data.get("data", {}).get("orderStatus", "PENDING")
         return {"status": status, "is_completed": status == "COMPLETED"}
 
+# --- IMPORTANT: Include the router ---
 app.include_router(api_router)
+
+# --- CORS (allow all origins) ---
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
