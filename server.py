@@ -10,21 +10,20 @@ app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
 # --- UroPay Configuration ---
-UROPAY_API_KEY = os.environ.get("UROPAY_API_KEY", "YOUR_API_KEY_HERE")
-UROPAY_SECRET = os.environ.get("UROPAY_SECRET", "YOUR_SECRET_HERE")
+UROPAY_API_KEY = os.environ.get("UROPAY_API_KEY", "")
+UROPAY_SECRET = os.environ.get("UROPAY_SECRET", "")
 UROPAY_BASE_URL = "https://api.uropay.me"
 
 def get_uropay_headers():
-    """Create the headers required for UroPay API requests."""
     hashed_secret = hashlib.sha512(UROPAY_SECRET.encode("utf-8")).hexdigest()
     return {
-        "X-API-KEY": UROPAY_KEY,
+        "X-API-KEY": UROPAY_API_KEY,
         "Authorization": f"Bearer {hashed_secret}",
         "Content-Type": "application/json",
         "Accept": "application/json"
     }
 
-# --- Groq AI (unchanged) ---
+# --- Groq AI ---
 groq_client = OpenAI(
     api_key=os.environ.get("GROQ_API_KEY", ""),
     base_url="https://api.groq.com/openai/v1"
@@ -52,23 +51,25 @@ async def ask_question(req: AskRequest):
         return {"answer": f"Buddy is thinking... try again! Error: {str(e)[:100]}"}
 
 # --- UroPay: Generate QR Code ---
-class GenerateOrderRequest(BaseModel):
+class GenerateUroPayOrder(BaseModel):
     amount_paise: int = 9900
     customer_name: str = "Buddy User"
     customer_email: str = "user@example.com"
 
-@api_router.post("/upi/generate-qr")
-async def generate_upi_qr(req: GenerateOrderRequest):
+@api_router.post("/uropay/generate-qr")
+async def generate_uropay_qr(req: GenerateUroPayOrder):
     async with httpx.AsyncClient() as client:
         response = await client.post(
             f"{UROPAY_BASE_URL}/order/generate",
             headers=get_uropay_headers(),
             json={
+                "vpa": "9319300296@ybl",
+                "vpaName": "Buddy Premium",
                 "amount": req.amount_paise,
                 "merchantOrderId": f"buddy_{os.urandom(4).hex()}",
                 "customerName": req.customer_name,
                 "customerEmail": req.customer_email,
-                "transactionNote": "Buddy Premium"
+                "transactionNote": "Buddy Premium Upgrade"
             }
         )
         data = response.json()
@@ -78,17 +79,15 @@ async def generate_upi_qr(req: GenerateOrderRequest):
             "order_id": data["data"]["uroPayOrderId"]
         }
 
-# --- UroPay: Verify Payment & Activate Premium ---
-class VerifyUpiRequest(BaseModel):
+# --- UroPay: Update order with UTR ---
+class UpdateUroPayOrder(BaseModel):
     order_id: str
     utr: str
-    session_id: str
 
-@api_router.post("/upi/verify")
-async def verify_upi_payment(req: VerifyUpiRequest):
+@api_router.post("/uropay/update-order")
+async def update_uropay_order(req: UpdateUroPayOrder):
     async with httpx.AsyncClient() as client:
-        # Submit the UTR to UroPay
-        await client.patch(
+        response = await client.patch(
             f"{UROPAY_BASE_URL}/order/update",
             headers=get_uropay_headers(),
             json={
@@ -96,18 +95,19 @@ async def verify_upi_payment(req: VerifyUpiRequest):
                 "referenceNumber": req.utr
             }
         )
-        # Check the order status
-        status_response = await client.get(
-            f"{UROPAY_BASE_URL}/order/status/{req.order_id}",
+        return response.json()
+
+# --- UroPay: Check order status ---
+@api_router.get("/uropay/status/{order_id}")
+async def check_uropay_status(order_id: str):
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{UROPAY_BASE_URL}/order/status/{order_id}",
             headers={"X-API-KEY": UROPAY_API_KEY, "Accept": "application/json"}
         )
-        status_data = status_response.json()
-        is_completed = status_data.get("data", {}).get("orderStatus") == "COMPLETED"
-        
-        return {
-            "is_premium": is_completed,
-            "message": "Premium activated!" if is_completed else "Payment verification in progress..."
-        }
+        data = response.json()
+        status = data.get("data", {}).get("orderStatus", "PENDING")
+        return {"status": status, "is_completed": status == "COMPLETED"}
 
 app.include_router(api_router)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
