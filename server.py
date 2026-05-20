@@ -5,7 +5,6 @@ import os
 import hashlib
 import httpx
 from openai import OpenAI
-from typing import List, Optional
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -33,6 +32,7 @@ groq_client = OpenAI(
 class AskRequest(BaseModel):
     question: str
     subject: str = "general"
+    session_id: str = ""           # <-- now accepted in the body
 
 class GenerateUroPayOrder(BaseModel):
     amount_paise: int = 9900
@@ -49,7 +49,6 @@ class ScanRequest(BaseModel):
     question_text: str = ""
 
 # --- Simple in-memory history store (per session) ---
-# Format: { session_id: [ {id, subject, question, answer, created_at}, ... ] }
 history_store = {}
 
 # ---------- Root ----------
@@ -59,7 +58,7 @@ async def root():
 
 # ---------- AI Ask ----------
 @api_router.post("/ask")
-async def ask_question(req: AskRequest, session_id: str = ""):
+async def ask_question(req: AskRequest):
     try:
         prompt = f"You are Buddy, a friendly homework helper for kids. Subject: {req.subject}. Question: {req.question}. Give a clear, simple, step-by-step answer. Be encouraging and fun!"
         response = groq_client.chat.completions.create(
@@ -70,7 +69,7 @@ async def ask_question(req: AskRequest, session_id: str = ""):
         answer = response.choices[0].message.content
 
         # Save to history (if session_id provided)
-        if session_id:
+        if req.session_id:
             import uuid, datetime
             item = {
                 "id": str(uuid.uuid4()),
@@ -79,7 +78,7 @@ async def ask_question(req: AskRequest, session_id: str = ""):
                 "answer": answer,
                 "created_at": datetime.datetime.now().isoformat()
             }
-            history_store.setdefault(session_id, []).append(item)
+            history_store.setdefault(req.session_id, []).append(item)
 
         return {"answer": answer}
     except Exception as e:
