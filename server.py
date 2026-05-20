@@ -1,10 +1,11 @@
-from fastapi import FastAPI, APIRouter, Request
+from fastapi import FastAPI, APIRouter
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 import hashlib
 import httpx
 from openai import OpenAI
+from typing import List, Optional
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -47,6 +48,10 @@ class ScanRequest(BaseModel):
     image_base64: str = ""
     question_text: str = ""
 
+# --- Simple in-memory history store (per session) ---
+# Format: { session_id: [ {id, subject, question, answer, created_at}, ... ] }
+history_store = {}
+
 # ---------- Root ----------
 @api_router.get("/")
 async def root():
@@ -54,7 +59,7 @@ async def root():
 
 # ---------- AI Ask ----------
 @api_router.post("/ask")
-async def ask_question(req: AskRequest):
+async def ask_question(req: AskRequest, session_id: str = ""):
     try:
         prompt = f"You are Buddy, a friendly homework helper for kids. Subject: {req.subject}. Question: {req.question}. Give a clear, simple, step-by-step answer. Be encouraging and fun!"
         response = groq_client.chat.completions.create(
@@ -62,9 +67,41 @@ async def ask_question(req: AskRequest):
             messages=[{"role": "user", "content": prompt}],
             max_tokens=500
         )
-        return {"answer": response.choices[0].message.content}
+        answer = response.choices[0].message.content
+
+        # Save to history (if session_id provided)
+        if session_id:
+            import uuid, datetime
+            item = {
+                "id": str(uuid.uuid4()),
+                "subject": req.subject,
+                "question": req.question,
+                "answer": answer,
+                "created_at": datetime.datetime.now().isoformat()
+            }
+            history_store.setdefault(session_id, []).append(item)
+
+        return {"answer": answer}
     except Exception as e:
         return {"answer": f"Buddy is thinking... try again! Error: {str(e)[:100]}"}
+
+# ---------- History endpoints ----------
+@api_router.get("/history")
+async def get_history(session_id: str = ""):
+    items = history_store.get(session_id, [])
+    return {"items": items}
+
+@api_router.delete("/history")
+async def clear_history(session_id: str = ""):
+    if session_id in history_store:
+        del history_store[session_id]
+    return {"deleted": True}
+
+@api_router.delete("/history/{item_id}")
+async def delete_history_item(item_id: str, session_id: str = ""):
+    if session_id in history_store:
+        history_store[session_id] = [i for i in history_store[session_id] if i["id"] != item_id]
+    return {"deleted": True}
 
 # ---------- UroPay: Generate QR ----------
 @api_router.post("/uropay/generate-qr")
@@ -128,20 +165,16 @@ async def premium_status(session_id: str = ""):
         "price_paise": 9900
     }
 
-# ---------- Scan (VISION AI – reads the photo!) ----------
+# ---------- Scan (VISION AI) ----------
 @api_router.post("/scan")
 async def scan_homework(req: ScanRequest):
     if not req.image_base64:
         return {"answer": "Please upload a photo of your homework."}
-
-    # Build the vision prompt
     prompt = f"Look at the homework problem in the image. Subject: {req.subject}. "
     if req.question_text:
         prompt += f"Additional note: {req.question_text}. "
     prompt += "Read the problem, solve it, and give a clear step-by-step answer. Be encouraging!"
-
     try:
-        # Use Groq's vision model
         response = groq_client.chat.completions.create(
             model="llama-3.2-90b-vision-preview",
             messages=[{
@@ -155,8 +188,7 @@ async def scan_homework(req: ScanRequest):
         )
         return {"answer": response.choices[0].message.content}
     except Exception as e:
-        # Fallback if vision model unavailable
-        return {"answer": f"Buddy couldn't read the photo. Please type the question or try a clearer image. (Error: {str(e)[:100]})"}
+        return {"answer": f"Buddy couldn't read the photo. Please type the question or try a clearer image. Error: {str(e)[:100]}"}
 
 # ---------- Include router & enable CORS ----------
 app.include_router(api_router)
