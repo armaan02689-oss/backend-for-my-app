@@ -10,7 +10,7 @@ from typing import Optional
 try:
     import google.generativeai as genai
     genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
-    gemini_model = genai.GenerativeModel("gemini-2.0-flash-lite")
+    gemini_model = genai.GenerativeModel("gemini-3.5-flash-lite")
 except Exception as e:
     print("Gemini init error:", e)
     gemini_model = None
