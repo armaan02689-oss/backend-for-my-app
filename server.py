@@ -4,7 +4,16 @@ from pydantic import BaseModel
 import os
 import hashlib
 import httpx
-from openai import OpenAI
+from typing import Optional
+
+# --- Google Gemini ---
+try:
+    import google.generativeai as genai
+    genai.configure(api_key=os.environ.get("GEMINI_API_KEY", ""))
+    gemini_model = genai.GenerativeModel("gemini-2.0-flash-lite")
+except Exception as e:
+    print("Gemini init error:", e)
+    gemini_model = None
 
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
@@ -23,16 +32,11 @@ def get_uropay_headers():
         "Accept": "application/json"
     }
 
-# --- Groq AI ---
-groq_client = OpenAI(
-    api_key=os.environ.get("GROQ_API_KEY", ""),
-    base_url="https://api.groq.com/openai/v1"
-)
-
+# --- Request models ---
 class AskRequest(BaseModel):
     question: str
     subject: str = "general"
-    session_id: str = ""           # <-- now accepted in the body
+    session_id: str = ""
 
 class GenerateUroPayOrder(BaseModel):
     amount_paise: int = 9900
@@ -48,7 +52,6 @@ class ScanRequest(BaseModel):
     image_base64: str = ""
     question_text: str = ""
 
-# --- Simple in-memory history store (per session) ---
 history_store = {}
 
 # ---------- Root ----------
@@ -56,19 +59,23 @@ history_store = {}
 async def root():
     return {"message": "Hello World"}
 
-# ---------- AI Ask ----------
+# ---------- AI Ask (Gemini) ----------
 @api_router.post("/ask")
 async def ask_question(req: AskRequest):
-    try:
-        prompt = f"You are Buddy, a friendly homework helper for kids. Subject: {req.subject}. Question: {req.question}. Give a clear, simple, step-by-step answer. Be encouraging and fun!"
-        response = groq_client.chat.completions.create(
-            model="llama-3.3-70b-versatile",
-            messages=[{"role": "user", "content": prompt}],
-            max_tokens=500
-        )
-        answer = response.choices[0].message.content
+    if not gemini_model:
+        return {"answer": "AI is not configured properly."}
 
-        # Save to history (if session_id provided)
+    prompt = (
+        f"You are Buddy, a friendly homework helper for kids. "
+        f"Subject: {req.subject}. "
+        f"Question: {req.question}. "
+        f"IMPORTANT: Keep your answer SHORT and to the point. "
+        f"If it's a simple math question like 2+2, just give the answer with one short line. "
+        f"For bigger questions, give a brief step-by-step explanation in under 150 words."
+    )
+    try:
+        response = gemini_model.generate_content(prompt)
+        answer = response.text
         if req.session_id:
             import uuid, datetime
             item = {
@@ -79,16 +86,14 @@ async def ask_question(req: AskRequest):
                 "created_at": datetime.datetime.now().isoformat()
             }
             history_store.setdefault(req.session_id, []).append(item)
-
         return {"answer": answer}
     except Exception as e:
-        return {"answer": f"Buddy is thinking... try again! Error: {str(e)[:100]}"}
+        return {"answer": f"Error: {str(e)[:150]}"}
 
-# ---------- History endpoints ----------
+# ---------- History ----------
 @api_router.get("/history")
 async def get_history(session_id: str = ""):
-    items = history_store.get(session_id, [])
-    return {"items": items}
+    return {"items": history_store.get(session_id, [])}
 
 @api_router.delete("/history")
 async def clear_history(session_id: str = ""):
@@ -128,7 +133,6 @@ async def generate_uropay_qr(req: GenerateUroPayOrder):
             "order_id": data["data"]["uroPayOrderId"]
         }
 
-# ---------- UroPay: Update order with UTR ----------
 @api_router.post("/uropay/update-order")
 async def update_uropay_order(req: UpdateUroPayOrder):
     async with httpx.AsyncClient() as client:
@@ -142,7 +146,6 @@ async def update_uropay_order(req: UpdateUroPayOrder):
         )
         return response.json()
 
-# ---------- UroPay: Check order status ----------
 @api_router.get("/uropay/status/{order_id}")
 async def check_uropay_status(order_id: str):
     async with httpx.AsyncClient() as client:
@@ -164,31 +167,24 @@ async def premium_status(session_id: str = ""):
         "price_paise": 9900
     }
 
-# ---------- Scan (VISION AI) ----------
+# ---------- Scan ----------
 @api_router.post("/scan")
 async def scan_homework(req: ScanRequest):
     if not req.image_base64:
-        return {"answer": "Please upload a photo of your homework."}
-    prompt = f"Look at the homework problem in the image. Subject: {req.subject}. "
-    if req.question_text:
-        prompt += f"Additional note: {req.question_text}. "
-    prompt += "Read the problem, solve it, and give a clear step-by-step answer. Be encouraging!"
+        return {"answer": "Please upload a photo."}
+    if not gemini_model:
+        return {"answer": "AI is not configured."}
+    prompt = f"Look at this homework image. Subject: {req.subject}. Solve the problem briefly."
     try:
-        response = groq_client.chat.completions.create(
-            model="llama-3.2-90b-vision-preview",
-            messages=[{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": prompt},
-                    {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{req.image_base64}"}}
-                ]
-            }],
-            max_tokens=600
-        )
-        return {"answer": response.choices[0].message.content}
+        import base64
+        image_data = base64.b64decode(req.image_base64)
+        response = gemini_model.generate_content([
+            prompt,
+            {"mime_type": "image/jpeg", "data": image_data}
+        ])
+        return {"answer": response.text}
     except Exception as e:
-        return {"answer": f"Buddy couldn't read the photo. Please type the question or try a clearer image. Error: {str(e)[:100]}"}
+        return {"answer": f"Error: {str(e)[:150]}"}
 
-# ---------- Include router & enable CORS ----------
 app.include_router(api_router)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
