@@ -147,43 +147,66 @@ async def scan_homework(req: ScanRequest):
     except Exception as e:
         return {"answer": f"Error: {str(e)[:150]}"}
 
-# ---------- UroPay: Create Payment Order ----------
+# ---------- UroPay: Create Payment Order (DEBUG VERSION) ----------
 @api_router.post("/payment/create-order")
 async def create_payment_order(req: CreateOrderRequest):
     order_id = f"buddy_{int(time.time())}_{os.urandom(2).hex()}"
     amount_paise = PREMIUM_PRICE_RUPEES * 100
 
-    async with httpx.AsyncClient() as client:
-        response = await client.post(
-            f"{UROPAY_BASE_URL}/order/generate",
-            headers=get_uropay_headers(),
-            json={
-                "vpa": "9319300296@ybl",
-                "vpaName": "AsksBuddy",
-                "amount": amount_paise,
-                "merchantOrderId": order_id,
-                "customerName": "Buddy User",
-                "customerEmail": "user@example.com",
-                "transactionNote": "AsksBuddy Premium"
+    request_body = {
+        "vpa": "9319300296@ybl",
+        "vpaName": "AsksBuddy",
+        "amount": amount_paise,
+        "merchantOrderId": order_id,
+        "customerName": "Buddy User",
+        "customerEmail": "user@example.com",
+        "transactionNote": "AsksBuddy Premium"
+    }
+
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{UROPAY_BASE_URL}/order/generate",
+                headers=get_uropay_headers(),
+                json=request_body
+            )
+            print("UroPay status:", response.status_code)
+            print("UroPay response:", response.text)
+
+            if response.status_code != 200:
+                return {
+                    "error": "UroPay rejected the request",
+                    "status_code": response.status_code,
+                    "uropay_response": response.text[:500],
+                    "sent_body": request_body,
+                    "has_api_key": bool(UROPAY_API_KEY),
+                    "has_secret": bool(UROPAY_SECRET)
+                }
+
+            data = response.json()
+            if "data" not in data:
+                return {"error": "No data in response", "details": data}
+
+            pending_orders[order_id] = {
+                "uropay_order_id": data["data"].get("uroPayOrderId"),
+                "amount": PREMIUM_PRICE_RUPEES,
+                "created_at": time.time(),
+                "session_id": req.session_id
             }
-        )
-        data = response.json()
-        if "data" not in data:
-            return {"error": "Failed to create order", "details": data}
 
-        pending_orders[order_id] = {
-            "uropay_order_id": data["data"].get("uroPayOrderId"),
-            "amount": PREMIUM_PRICE_RUPEES,
-            "created_at": time.time(),
-            "session_id": req.session_id
-        }
-
+            return {
+                "order_id": order_id,
+                "amount": PREMIUM_PRICE_RUPEES,
+                "qr_code": data["data"]["qrCode"],
+                "upi_link": data["data"]["upiString"],
+                "uropay_order_id": data["data"].get("uroPayOrderId")
+            }
+    except Exception as e:
         return {
-            "order_id": order_id,
-            "amount": PREMIUM_PRICE_RUPEES,
-            "qr_code": data["data"]["qrCode"],
-            "upi_link": data["data"]["upiString"],
-            "uropay_order_id": data["data"].get("uroPayOrderId")
+            "error": "Exception during request",
+            "error_message": str(e)[:300],
+            "has_api_key": bool(UROPAY_API_KEY),
+            "has_secret": bool(UROPAY_SECRET)
         }
 
 # ---------- UroPay: Verify Payment ----------
@@ -197,26 +220,33 @@ async def verify_payment(req: VerifyOrderRequest):
         del pending_orders[req.order_id]
         return {"verified": False, "message": "Order expired. Please try again."}
 
-    async with httpx.AsyncClient() as client:
-        response = await client.get(
-            f"{UROPAY_BASE_URL}/order/status/{order['uropay_order_id']}",
-            headers={"X-API-KEY": UROPAY_API_KEY, "Accept": "application/json"}
-        )
-        data = response.json()
-        status = data.get("data", {}).get("orderStatus", "PENDING")
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(
+                f"{UROPAY_BASE_URL}/order/status/{order['uropay_order_id']}",
+                headers={"X-API-KEY": UROPAY_API_KEY, "Accept": "application/json"}
+            )
+            data = response.json()
+            status = data.get("data", {}).get("orderStatus", "PENDING")
 
-        if status == "COMPLETED":
-            expiry = time.time() + (PREMIUM_DAYS * 24 * 60 * 60)
-            premium_users[req.session_id] = expiry
-            del pending_orders[req.order_id]
+            if status == "COMPLETED":
+                expiry = time.time() + (PREMIUM_DAYS * 24 * 60 * 60)
+                premium_users[req.session_id] = expiry
+                del pending_orders[req.order_id]
+                return {
+                    "verified": True,
+                    "message": "Premium unlocked for 1 year! 🎉",
+                    "expires_at": expiry,
+                    "days": PREMIUM_DAYS
+                }
+
             return {
-                "verified": True,
-                "message": "Premium unlocked for 1 year! 🎉",
-                "expires_at": expiry,
-                "days": PREMIUM_DAYS
+                "verified": False,
+                "message": "Payment not confirmed yet. Try again in a moment.",
+                "current_status": status
             }
-
-        return {"verified": False, "message": "Payment not confirmed yet. Try again in a moment."}
+    except Exception as e:
+        return {"verified": False, "message": f"Error: {str(e)[:150]}"}
 
 app.include_router(api_router)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
