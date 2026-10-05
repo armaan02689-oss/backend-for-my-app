@@ -1,16 +1,11 @@
-from fastapi import FastAPI, APIRouter
+from fastapi import FastAPI, APIRouter, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 import os
 import hashlib
 import httpx
-import imaplib
-import email
-import re
-import random
 import time
 from datetime import datetime, timezone
-from typing import Optional
 
 # --- Google Gemini ---
 try:
@@ -24,18 +19,30 @@ except Exception as e:
 app = FastAPI()
 api_router = APIRouter(prefix="/api")
 
-# --- Gmail IMAP config (for payment verification) ---
-GMAIL_USER = os.environ.get("GMAIL_USER", "")
-GMAIL_APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD", "")
-YOUR_UPI_ID = "9319300296@ybl"
+# --- UroPay Configuration ---
+UROPAY_API_KEY = os.environ.get("UROPAY_API_KEY", "")
+UROPAY_SECRET = os.environ.get("UROPAY_SECRET", "")
+UROPAY_BASE_URL = "https://api.uropay.me"
 
-# In-memory stores
+def get_uropay_headers():
+    hashed_secret = hashlib.sha512(UROPAY_SECRET.encode("utf-8")).hexdigest()
+    return {
+        "X-API-KEY": UROPAY_API_KEY,
+        "Authorization": f"Bearer {hashed_secret}",
+        "Content-Type": "application/json",
+        "Accept": "application/json"
+    }
+
+# --- Premium config ---
+PREMIUM_PRICE_RUPEES = 199
+PREMIUM_DAYS = 365
+
+# In-memory stores (reset on server restart)
 history_store = {}          # { session_id: [items] }
-premium_users = set()       # session_ids with active premium
+premium_users = {}          # { session_id: expiry_timestamp }
 pending_orders = {}         # { order_id: { amount, created_at, session_id } }
-used_utrs = set()           # prevent replay attacks
 
-# ---------- Request models ----------
+# ---------- Models ----------
 class AskRequest(BaseModel):
     question: str
     subject: str = "general"
@@ -107,11 +114,18 @@ async def delete_history_item(item_id: str, session_id: str = ""):
 # ---------- Premium status ----------
 @api_router.get("/premium/status")
 async def premium_status(session_id: str = ""):
+    expiry = premium_users.get(session_id, 0)
+    now = time.time()
+    is_premium = expiry > now
+    days_left = max(0, int((expiry - now) / 86400)) if is_premium else 0
     return {
-        "is_premium": session_id in premium_users,
+        "is_premium": is_premium,
+        "days_left": days_left,
+        "expires_at": expiry if is_premium else None,
         "scans_used": 0,
         "scans_limit": 5,
-        "price_paise": 9900
+        "price_paise": PREMIUM_PRICE_RUPEES * 100,
+        "duration_days": PREMIUM_DAYS,
     }
 
 # ---------- Scan (Gemini Vision) ----------
@@ -134,138 +148,83 @@ async def scan_homework(req: ScanRequest):
         return {"answer": f"Error: {str(e)[:150]}"}
 
 # ============================================================
-# PAYMENT / PREMIUM UNLOCK
+# UROPAY PAYMENT ENDPOINTS
 # ============================================================
-
-def read_gmail_for_payment(expected_amount: float, max_age_minutes: int = 15):
-    """
-    Connect to Gmail via IMAP, search recent emails for a bank credit
-    alert matching the expected amount, and return (utr, amount) if found.
-    """
-    if not GMAIL_USER or not GMAIL_APP_PASSWORD:
-        return None
-
-    try:
-        mail = imaplib.IMAP4_SSL("imap.gmail.com")
-        mail.login(GMAIL_USER, GMAIL_APP_PASSWORD)
-        mail.select("inbox")
-
-        # Search emails from the last hour
-        since_date = (datetime.now() - __import__("datetime").timedelta(hours=1)).strftime("%d-%b-%Y")
-        status, messages = mail.search(None, f'(SINCE "{since_date}")')
-        if status != "OK":
-            mail.logout()
-            return None
-
-        email_ids = messages[0].split()
-        # Check most recent 30 emails
-        for eid in reversed(email_ids[-30:]):
-            status, msg_data = mail.fetch(eid, "(RFC822)")
-            if status != "OK":
-                continue
-            msg = email.message_from_bytes(msg_data[0][1])
-            body = ""
-            if msg.is_multipart():
-                for part in msg.walk():
-                    if part.get_content_type() == "text/plain":
-                        body += part.get_payload(decode=True).decode(errors="ignore")
-            else:
-                body = msg.get_payload(decode=True).decode(errors="ignore")
-
-            body_lower = body.lower()
-            # Look for credit/payment keywords
-            if not any(k in body_lower for k in ["credited", "received", "payment", "upi"]):
-                continue
-
-            # Find amount (e.g., Rs.99.37 or ₹99.37 or INR 99.37)
-            amounts = re.findall(r'(?:rs\.?|inr|₹)\s*([\d,]+\.?\d*)', body_lower)
-            for amt_str in amounts:
-                amt = float(amt_str.replace(",", ""))
-                if abs(amt - expected_amount) < 0.01:
-                    # Find UTR (12-digit number)
-                    utrs = re.findall(r'\b(\d{12})\b', body)
-                    if utrs:
-                        mail.logout()
-                        return {"utr": utrs[0], "amount": amt}
-
-        mail.logout()
-    except Exception as e:
-        print("Gmail read error:", e)
-
-    return None
-
 
 @api_router.post("/payment/create-order")
 async def create_payment_order(req: CreateOrderRequest):
-    """Generate a unique amount QR code for the user to pay."""
-    # Add random paise to make each order unique (e.g., 99.01 to 99.99)
-    base_amount = 99.00
-    random_paise = random.randint(1, 99) / 100
-    unique_amount = round(base_amount + random_paise, 2)
+    """Create a UroPay order and return QR code + UPI link."""
+    order_id = f"buddy_{int(time.time())}_{os.urandom(2).hex()}"
+    amount_paise = PREMIUM_PRICE_RUPEES * 100
 
-    order_id = f"ord_{int(time.time())}_{random.randint(1000, 9999)}"
+    async with httpx.AsyncClient() as client:
+        response = await client.post(
+            f"{UROPAY_BASE_URL}/order/generate",
+            headers=get_uropay_headers(),
+            json={
+                "vpa": "9319300296@ybl",
+                "vpaName": "AsksBuddy",
+                "amount": amount_paise,
+                "merchantOrderId": order_id,
+                "customerName": "Buddy User",
+                "customerEmail": "user@example.com",
+                "transactionNote": "AsksBuddy Premium"
+            }
+        )
+        data = response.json()
+        if "data" not in data:
+            return {"error": "Failed to create order", "details": data}
 
-    pending_orders[order_id] = {
-        "amount": unique_amount,
-        "created_at": time.time(),
-        "session_id": req.session_id
-    }
+        # Store order locally
+        pending_orders[order_id] = {
+            "uropay_order_id": data["data"].get("uroPayOrderId"),
+            "amount": PREMIUM_PRICE_RUPEES,
+            "created_at": time.time(),
+            "session_id": req.session_id
+        }
 
-    upi_link = (
-        f"upi://pay?pa={YOUR_UPI_ID}"
-        f"&pn=AsksBuddy"
-        f"&am={unique_amount}"
-        f"&cu=INR"
-        f"&tn=AsksBuddy Premium {order_id}"
-    )
-
-    return {
-        "order_id": order_id,
-        "amount": unique_amount,
-        "upi_id": YOUR_UPI_ID,
-        "upi_link": upi_link
-    }
-
+        return {
+            "order_id": order_id,
+            "amount": PREMIUM_PRICE_RUPEES,
+            "qr_code": data["data"]["qrCode"],
+            "upi_link": data["data"]["upiString"],
+            "uropay_order_id": data["data"].get("uroPayOrderId")
+        }
 
 @api_router.post("/payment/verify")
 async def verify_payment(req: VerifyOrderRequest):
-    """
-    Check Gmail for a matching payment. If found and UTR is new,
-    unlock Premium for the session.
-    """
+    """Check UroPay order status. If PAID, unlock premium for 365 days."""
     order = pending_orders.get(req.order_id)
     if not order:
         return {"verified": False, "message": "Order not found or expired."}
 
-    # Expire orders older than 30 minutes
+    # Expire after 30 minutes
     if time.time() - order["created_at"] > 1800:
         del pending_orders[req.order_id]
         return {"verified": False, "message": "Order expired. Please try again."}
 
-    # Search Gmail for the payment
-    result = read_gmail_for_payment(order["amount"])
+    # Check UroPay order status
+    async with httpx.AsyncClient() as client:
+        response = await client.get(
+            f"{UROPAY_BASE_URL}/order/status/{order['uropay_order_id']}",
+            headers={"X-API-KEY": UROPAY_API_KEY, "Accept": "application/json"}
+        )
+        data = response.json()
+        status = data.get("data", {}).get("orderStatus", "PENDING")
 
-    if result:
-        utr = result["utr"]
+        if status == "COMPLETED":
+            # Grant 1 year premium
+            expiry = time.time() + (PREMIUM_DAYS * 24 * 60 * 60)
+            premium_users[req.session_id] = expiry
+            del pending_orders[req.order_id]
+            return {
+                "verified": True,
+                "message": "Premium unlocked for 1 year! 🎉",
+                "expires_at": expiry,
+                "days": PREMIUM_DAYS
+            }
 
-        # Prevent replay attacks (same UTR used twice)
-        if utr in used_utrs:
-            return {"verified": False, "message": "This transaction was already used."}
-
-        # ✅ Payment verified!
-        used_utrs.add(utr)
-        premium_users.add(req.session_id)
-        del pending_orders[req.order_id]
-
-        return {
-            "verified": True,
-            "message": "Premium unlocked! 🎉",
-            "utr": utr,
-            "amount": result["amount"]
-        }
-
-    return {"verified": False, "message": "Payment not found yet. Wait a few seconds and try again."}
-
+        return {"verified": False, "message": "Payment not confirmed yet. Try again in a moment."}
 
 app.include_router(api_router)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
