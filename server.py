@@ -37,10 +37,10 @@ def get_uropay_headers():
 PREMIUM_PRICE_RUPEES = 199
 PREMIUM_DAYS = 365
 
-# In-memory stores (reset on server restart)
-history_store = {}          # { session_id: [items] }
-premium_users = {}          # { session_id: expiry_timestamp }
-pending_orders = {}         # { order_id: { amount, created_at, session_id } }
+# In-memory stores
+history_store = {}
+premium_users = {}
+pending_orders = {}
 
 # ---------- Models ----------
 class AskRequest(BaseModel):
@@ -147,13 +147,9 @@ async def scan_homework(req: ScanRequest):
     except Exception as e:
         return {"answer": f"Error: {str(e)[:150]}"}
 
-# ============================================================
-# UROPAY PAYMENT ENDPOINTS
-# ============================================================
-
+# ---------- UroPay: Create Payment Order ----------
 @api_router.post("/payment/create-order")
 async def create_payment_order(req: CreateOrderRequest):
-    """Create a UroPay order and return QR code + UPI link."""
     order_id = f"buddy_{int(time.time())}_{os.urandom(2).hex()}"
     amount_paise = PREMIUM_PRICE_RUPEES * 100
 
@@ -175,7 +171,6 @@ async def create_payment_order(req: CreateOrderRequest):
         if "data" not in data:
             return {"error": "Failed to create order", "details": data}
 
-        # Store order locally
         pending_orders[order_id] = {
             "uropay_order_id": data["data"].get("uroPayOrderId"),
             "amount": PREMIUM_PRICE_RUPEES,
@@ -191,19 +186,17 @@ async def create_payment_order(req: CreateOrderRequest):
             "uropay_order_id": data["data"].get("uroPayOrderId")
         }
 
+# ---------- UroPay: Verify Payment ----------
 @api_router.post("/payment/verify")
 async def verify_payment(req: VerifyOrderRequest):
-    """Check UroPay order status. If PAID, unlock premium for 365 days."""
     order = pending_orders.get(req.order_id)
     if not order:
         return {"verified": False, "message": "Order not found or expired."}
 
-    # Expire after 30 minutes
     if time.time() - order["created_at"] > 1800:
         del pending_orders[req.order_id]
         return {"verified": False, "message": "Order expired. Please try again."}
 
-    # Check UroPay order status
     async with httpx.AsyncClient() as client:
         response = await client.get(
             f"{UROPAY_BASE_URL}/order/status/{order['uropay_order_id']}",
@@ -213,7 +206,6 @@ async def verify_payment(req: VerifyOrderRequest):
         status = data.get("data", {}).get("orderStatus", "PENDING")
 
         if status == "COMPLETED":
-            # Grant 1 year premium
             expiry = time.time() + (PREMIUM_DAYS * 24 * 60 * 60)
             premium_users[req.session_id] = expiry
             del pending_orders[req.order_id]
